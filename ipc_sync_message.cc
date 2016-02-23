@@ -2,18 +2,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "build/build_config.h"
+#include "ipc/ipc_sync_message.h"
 
-#if defined(OS_WIN)
-#include <windows.h>
-#endif
+#include <stdint.h>
+
 #include <stack>
 
 #include "base/atomic_sequence_num.h"
 #include "base/lazy_instance.h"
 #include "base/logging.h"
 #include "base/synchronization/waitable_event.h"
-#include "ipc/ipc_sync_message.h"
+#include "build/build_config.h"
 
 namespace {
 
@@ -36,15 +35,13 @@ namespace IPC {
 
 #define kSyncMessageHeaderSize 4
 
-SyncMessage::SyncMessage(
-    int32 routing_id,
-    uint32 type,
-    PriorityValue priority,
-    MessageReplyDeserializer* deserializer)
+SyncMessage::SyncMessage(int32_t routing_id,
+                         uint32_t type,
+                         PriorityValue priority,
+                         MessageReplyDeserializer* deserializer)
     : Message(routing_id, type, priority),
       deserializer_(deserializer),
-      pump_messages_event_(NULL)
-      {
+      pump_messages_event_(NULL) {
   set_sync();
   set_unblock(true);
 
@@ -74,10 +71,10 @@ bool SyncMessage::IsMessageReplyTo(const Message& msg, int request_id) {
   return GetMessageId(msg) == request_id;
 }
 
-PickleIterator SyncMessage::GetDataIterator(const Message* msg) {
-  PickleIterator iter(*msg);
+base::PickleIterator SyncMessage::GetDataIterator(const Message* msg) {
+  base::PickleIterator iter(*msg);
   if (!iter.SkipBytes(kSyncMessageHeaderSize))
-    return PickleIterator();
+    return base::PickleIterator();
   else
     return iter;
 }
@@ -112,8 +109,8 @@ Message* SyncMessage::GenerateReply(const Message* msg) {
 bool SyncMessage::ReadSyncHeader(const Message& msg, SyncHeader* header) {
   DCHECK(msg.is_sync() || msg.is_reply());
 
-  PickleIterator iter(msg);
-  bool result = msg.ReadInt(&iter, &header->message_id);
+  base::PickleIterator iter(msg);
+  bool result = iter.ReadInt(&header->message_id);
   if (!result) {
     NOTREACHED();
     return false;

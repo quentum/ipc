@@ -8,6 +8,7 @@
 #include <deque>
 #include <string>
 
+#include "base/macros.h"
 #include "base/memory/linked_ptr.h"
 #include "base/memory/scoped_ptr.h"
 #include "base/memory/weak_ptr.h"
@@ -38,13 +39,15 @@ class ChannelNacl : public Channel,
   ChannelNacl(const IPC::ChannelHandle& channel_handle,
               Mode mode,
               Listener* listener);
-  virtual ~ChannelNacl();
+  ~ChannelNacl() override;
 
   // Channel implementation.
-  virtual base::ProcessId GetPeerPID() const OVERRIDE;
-  virtual bool Connect() OVERRIDE;
-  virtual void Close() OVERRIDE;
-  virtual bool Send(Message* message) OVERRIDE;
+  base::ProcessId GetPeerPID() const override;
+  base::ProcessId GetSelfPID() const override;
+  bool Connect() override;
+  void Close() override;
+  bool Send(Message* message) override;
+  AttachmentBroker* GetAttachmentBroker() override;
 
   // Posted to the main thread by ReaderThreadRunner.
   void DidRecvMsg(scoped_ptr<MessageContents> contents);
@@ -58,12 +61,15 @@ class ChannelNacl : public Channel,
   void CallOnChannelConnected();
 
   // ChannelReader implementation.
-  virtual ReadState ReadData(char* buffer,
-                             int buffer_len,
-                             int* bytes_read) OVERRIDE;
-  virtual bool WillDispatchInputMessage(Message* msg) OVERRIDE;
-  virtual bool DidEmptyInputBuffers() OVERRIDE;
-  virtual void HandleInternalMessage(const Message& msg) OVERRIDE;
+  ReadState ReadData(char* buffer,
+                     int buffer_len,
+                     int* bytes_read) override;
+  bool ShouldDispatchInputMessage(Message* msg) override;
+  bool GetNonBrokeredAttachments(Message* msg) override;
+  bool DidEmptyInputBuffers() override;
+  void HandleInternalMessage(const Message& msg) override;
+  base::ProcessId GetSenderPID() override;
+  bool IsAttachmentBrokerEndpoint() override;
 
   Mode mode_;
   bool waiting_connect_;

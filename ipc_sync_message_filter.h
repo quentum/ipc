@@ -7,19 +7,21 @@
 
 #include <set>
 
-#include "base/basictypes.h"
+#include "base/macros.h"
 #include "base/memory/ref_counted.h"
+#include "base/memory/scoped_vector.h"
 #include "base/synchronization/lock.h"
 #include "ipc/ipc_sender.h"
 #include "ipc/ipc_sync_message.h"
 #include "ipc/message_filter.h"
 
 namespace base {
-class MessageLoopProxy;
+class SingleThreadTaskRunner;
 class WaitableEvent;
 }
 
 namespace IPC {
+class SyncChannel;
 
 // This MessageFilter allows sending synchronous IPC messages from a thread
 // other than the listener thread associated with the SyncChannel.  It does not
@@ -28,21 +30,28 @@ namespace IPC {
 // be used to send simultaneous synchronous messages from different threads.
 class IPC_EXPORT SyncMessageFilter : public MessageFilter, public Sender {
  public:
-  explicit SyncMessageFilter(base::WaitableEvent* shutdown_event);
-
   // MessageSender implementation.
-  virtual bool Send(Message* message) OVERRIDE;
+  bool Send(Message* message) override;
 
   // MessageFilter implementation.
-  virtual void OnFilterAdded(Sender* sender) OVERRIDE;
-  virtual void OnChannelError() OVERRIDE;
-  virtual void OnChannelClosing() OVERRIDE;
-  virtual bool OnMessageReceived(const Message& message) OVERRIDE;
+  void OnFilterAdded(Sender* sender) override;
+  void OnChannelError() override;
+  void OnChannelClosing() override;
+  bool OnMessageReceived(const Message& message) override;
 
  protected:
-  virtual ~SyncMessageFilter();
+  SyncMessageFilter(base::WaitableEvent* shutdown_event,
+                    bool is_channel_send_thread_safe);
+
+  ~SyncMessageFilter() override;
 
  private:
+  friend class SyncChannel;
+
+  void set_is_channel_send_thread_safe(bool is_channel_send_thread_safe) {
+    is_channel_send_thread_safe_ = is_channel_send_thread_safe;
+  }
+
   void SendOnIOThread(Message* message);
   // Signal all the pending sends as done, used in an error condition.
   void SignalAllEvents();
@@ -50,14 +59,20 @@ class IPC_EXPORT SyncMessageFilter : public MessageFilter, public Sender {
   // The channel to which this filter was added.
   Sender* sender_;
 
+  // Indicates if |sender_|'s Send method is thread-safe.
+  bool is_channel_send_thread_safe_;
+
   // The process's main thread.
-  scoped_refptr<base::MessageLoopProxy> listener_loop_;
+  scoped_refptr<base::SingleThreadTaskRunner> listener_task_runner_;
 
   // The message loop where the Channel lives.
-  scoped_refptr<base::MessageLoopProxy> io_loop_;
+  scoped_refptr<base::SingleThreadTaskRunner> io_task_runner_;
 
   typedef std::set<PendingSyncMsg*> PendingSyncMessages;
   PendingSyncMessages pending_sync_messages_;
+
+  // Messages waiting to be delivered after IO initialization.
+  ScopedVector<Message> pending_messages_;
 
   // Locks data members above.
   base::Lock lock_;

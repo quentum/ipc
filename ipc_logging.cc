@@ -8,16 +8,21 @@
 #define IPC_MESSAGE_MACROS_LOG_ENABLED
 #endif
 
+#include <stddef.h>
+#include <stdint.h>
+
 #include "base/bind.h"
 #include "base/bind_helpers.h"
 #include "base/command_line.h"
 #include "base/location.h"
 #include "base/logging.h"
-#include "base/message_loop/message_loop.h"
+#include "base/single_thread_task_runner.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
+#include "base/thread_task_runner_handle.h"
 #include "base/threading/thread.h"
 #include "base/time/time.h"
+#include "build/build_config.h"
 #include "ipc/ipc_message_utils.h"
 #include "ipc/ipc_sender.h"
 #include "ipc/ipc_switches.h"
@@ -76,7 +81,7 @@ Logging::~Logging() {
 }
 
 Logging* Logging::GetInstance() {
-  return Singleton<Logging>::get();
+  return base::Singleton<Logging>::get();
 }
 
 void Logging::SetConsumer(Consumer* consumer) {
@@ -109,7 +114,7 @@ void Logging::SetIPCSender(IPC::Sender* sender) {
 
 void Logging::OnReceivedLoggingMessage(const Message& message) {
   std::vector<LogData> data;
-  PickleIterator iter(message);
+  base::PickleIterator iter(message);
   if (!ReadParam(&message, &iter, &data))
     return;
 
@@ -161,12 +166,12 @@ void Logging::OnPostDispatchMessage(const Message& message,
   if (base::MessageLoop::current() == main_thread_) {
     Log(data);
   } else {
-    main_thread_->PostTask(
+    main_thread_->task_runner()->PostTask(
         FROM_HERE, base::Bind(&Logging::Log, base::Unretained(this), data));
   }
 }
 
-void Logging::GetMessageText(uint32 type, std::string* name,
+void Logging::GetMessageText(uint32_t type, std::string* name,
                              const Message* message,
                              std::string* params) {
   if (!log_function_map_)
@@ -231,9 +236,8 @@ void Logging::Log(const LogData& data) {
       queued_logs_.push_back(data);
       if (!queue_invoke_later_pending_) {
         queue_invoke_later_pending_ = true;
-        base::MessageLoop::current()->PostDelayedTask(
-            FROM_HERE,
-            base::Bind(&Logging::OnSendLogs, base::Unretained(this)),
+        base::ThreadTaskRunnerHandle::Get()->PostDelayedTask(
+            FROM_HERE, base::Bind(&Logging::OnSendLogs, base::Unretained(this)),
             base::TimeDelta::FromMilliseconds(kLogSendDelayMs));
       }
     }

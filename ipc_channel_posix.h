@@ -7,6 +7,7 @@
 
 #include "ipc/ipc_channel.h"
 
+#include <stddef.h>
 #include <sys/socket.h>  // for CMSG macros
 
 #include <queue>
@@ -14,38 +15,13 @@
 #include <string>
 #include <vector>
 
+#include "base/files/scoped_file.h"
+#include "base/macros.h"
 #include "base/message_loop/message_loop.h"
 #include "base/process/process.h"
-#include "ipc/file_descriptor_set_posix.h"
+#include "build/build_config.h"
 #include "ipc/ipc_channel_reader.h"
-
-#if !defined(OS_MACOSX)
-// On Linux, the seccomp sandbox makes it very expensive to call
-// recvmsg() and sendmsg(). The restriction on calling read() and write(), which
-// are cheap, is that we can't pass file descriptors over them.
-//
-// As we cannot anticipate when the sender will provide us with file
-// descriptors, we have to make the decision about whether we call read() or
-// recvmsg() before we actually make the call. The easiest option is to
-// create a dedicated socketpair() for exchanging file descriptors. Any file
-// descriptors are split out of a message, with the non-file-descriptor payload
-// going over the normal connection, and the file descriptors being sent
-// separately over the other channel. When read()ing from a channel, we'll
-// notice if the message was supposed to have come with file descriptors and
-// use recvmsg on the other socketpair to retrieve them and combine them
-// back with the rest of the message.
-//
-// Mac can also run in IPC_USES_READWRITE mode if necessary, but at this time
-// doesn't take a performance hit from recvmsg and sendmsg, so it doesn't
-// make sense to waste resources on having the separate dedicated socketpair.
-// It is however useful for debugging between Linux and Mac to be able to turn
-// this switch 'on' on the Mac as well.
-//
-// The HELLO message from the client to the server is always sent using
-// sendmsg because it will contain the file descriptor that the server
-// needs to send file descriptors in later messages.
-#define IPC_USES_READWRITE 1
-#endif
+#include "ipc/ipc_message_attachment_set.h"
 
 namespace IPC {
 
@@ -53,17 +29,21 @@ class IPC_EXPORT ChannelPosix : public Channel,
                                 public internal::ChannelReader,
                                 public base::MessageLoopForIO::Watcher {
  public:
-  ChannelPosix(const IPC::ChannelHandle& channel_handle, Mode mode,
+  // |broker| must outlive the newly created object.
+  ChannelPosix(const IPC::ChannelHandle& channel_handle,
+               Mode mode,
                Listener* listener);
-  virtual ~ChannelPosix();
+  ~ChannelPosix() override;
 
   // Channel implementation
-  virtual bool Connect() OVERRIDE;
-  virtual void Close() OVERRIDE;
-  virtual bool Send(Message* message) OVERRIDE;
-  virtual base::ProcessId GetPeerPID() const OVERRIDE;
-  virtual int GetClientFileDescriptor() const OVERRIDE;
-  virtual int TakeClientFileDescriptor() OVERRIDE;
+  bool Connect() override;
+  void Close() override;
+  bool Send(Message* message) override;
+  AttachmentBroker* GetAttachmentBroker() override;
+  base::ProcessId GetPeerPID() const override;
+  base::ProcessId GetSelfPID() const override;
+  int GetClientFileDescriptor() const override;
+  base::ScopedFD TakeClientFileDescriptor() override;
 
   // Returns true if the channel supports listening for connections.
   bool AcceptsConnections() const;
@@ -90,30 +70,30 @@ class IPC_EXPORT ChannelPosix : public Channel,
  private:
   bool CreatePipe(const IPC::ChannelHandle& channel_handle);
 
+  // Returns false on recoverable error.
+  // There are two reasons why this method might leave messages in the
+  // output_queue_.
+  //   1. |waiting_connect_| is |true|.
+  //   2. |is_blocked_on_write_| is |true|.
+  // If any of these conditionals change, this method should be called, as
+  // previously blocked messages may no longer be blocked.
   bool ProcessOutgoingMessages();
 
   bool AcceptConnection();
   void ClosePipeOnError();
-  int GetHelloMessageProcId();
+  int GetHelloMessageProcId() const;
   void QueueHelloMessage();
   void CloseFileDescriptors(Message* msg);
   void QueueCloseFDMessage(int fd, int hops);
 
   // ChannelReader implementation.
-  virtual ReadState ReadData(char* buffer,
-                             int buffer_len,
-                             int* bytes_read) OVERRIDE;
-  virtual bool WillDispatchInputMessage(Message* msg) OVERRIDE;
-  virtual bool DidEmptyInputBuffers() OVERRIDE;
-  virtual void HandleInternalMessage(const Message& msg) OVERRIDE;
-
-#if defined(IPC_USES_READWRITE)
-  // Reads the next message from the fd_pipe_ and appends them to the
-  // input_fds_ queue. Returns false if there was a message receiving error.
-  // True means there was a message and it was processed properly, or there was
-  // no messages.
-  bool ReadFileDescriptorsFromFDPipe();
-#endif
+  ReadState ReadData(char* buffer, int buffer_len, int* bytes_read) override;
+  bool ShouldDispatchInputMessage(Message* msg) override;
+  bool GetNonBrokeredAttachments(Message* msg) override;
+  bool DidEmptyInputBuffers() override;
+  void HandleInternalMessage(const Message& msg) override;
+  base::ProcessId GetSenderPID() override;
+  bool IsAttachmentBrokerEndpoint() override;
 
   // Finds the set of file descriptors in the given message.  On success,
   // appends the descriptors to the input_fds_ member and returns true
@@ -127,8 +107,20 @@ class IPC_EXPORT ChannelPosix : public Channel,
   void ClearInputFDs();
 
   // MessageLoopForIO::Watcher implementation.
-  virtual void OnFileCanReadWithoutBlocking(int fd) OVERRIDE;
-  virtual void OnFileCanWriteWithoutBlocking(int fd) OVERRIDE;
+  void OnFileCanReadWithoutBlocking(int fd) override;
+  void OnFileCanWriteWithoutBlocking(int fd) override;
+
+  // Returns |false| on channel error.
+  // If |message| has brokerable attachments, those attachments are passed to
+  // the AttachmentBroker (which in turn invokes Send()), so this method must
+  // be re-entrant.
+  // Adds |message| to |output_queue_| and calls ProcessOutgoingMessages().
+  bool ProcessMessageForDelivery(Message* message);
+
+  // Moves all messages from |prelim_queue_| to |output_queue_| by calling
+  // ProcessMessageForDelivery().
+  // Returns |false| on channel error.
+  bool FlushPrelimQueue();
 
   Mode mode_;
 
@@ -151,48 +143,48 @@ class IPC_EXPORT ChannelPosix : public Channel,
 
   // File descriptor we're listening on for new connections if we listen
   // for connections.
-  int server_listen_pipe_;
+  base::ScopedFD server_listen_pipe_;
 
   // The pipe used for communication.
-  int pipe_;
+  base::ScopedFD pipe_;
 
   // For a server, the client end of our socketpair() -- the other end of our
   // pipe_ that is passed to the client.
-  int client_pipe_;
+  base::ScopedFD client_pipe_;
   mutable base::Lock client_pipe_lock_;  // Lock that protects |client_pipe_|.
-
-#if defined(IPC_USES_READWRITE)
-  // Linux/BSD use a dedicated socketpair() for passing file descriptors.
-  int fd_pipe_;
-  int remote_fd_pipe_;
-#endif
 
   // The "name" of our pipe.  On Windows this is the global identifier for
   // the pipe.  On POSIX it's used as a key in a local map of file descriptors.
   std::string pipe_name_;
 
+  // Messages not yet ready to be sent are queued here. Messages removed from
+  // this queue are placed in the output_queue_. The double queue is
+  // unfortunate, but is necessary because messages with brokerable attachments
+  // can generate multiple messages to be sent (possibly from other channels).
+  // Some of these generated messages cannot be sent until |peer_pid_| has been
+  // configured.
+  // As soon as |peer_pid| has been configured, there is no longer any need for
+  // |prelim_queue_|. All messages are flushed, and no new messages are added.
+  std::queue<Message*> prelim_queue_;
+
   // Messages to be sent are queued here.
-  std::queue<Message*> output_queue_;
+  std::queue<OutputElement*> output_queue_;
 
   // We assume a worst case: kReadBufferSize bytes of messages, where each
   // message has no payload and a full complement of descriptors.
   static const size_t kMaxReadFDs =
       (Channel::kReadBufferSize / sizeof(IPC::Message::Header)) *
-      FileDescriptorSet::kMaxDescriptorsPerMessage;
+      MessageAttachmentSet::kMaxDescriptorsPerMessage;
 
   // Buffer size for file descriptors used for recvmsg. On Mac the CMSG macros
-  // don't seem to be constant so we have to pick a "large enough" value.
+  // are not constant so we have to pick a "large enough" padding for headers.
 #if defined(OS_MACOSX)
-  static const size_t kMaxReadFDBuffer = 1024;
+  static const size_t kMaxReadFDBuffer = 1024 + sizeof(int) * kMaxReadFDs;
 #else
   static const size_t kMaxReadFDBuffer = CMSG_SPACE(sizeof(int) * kMaxReadFDs);
 #endif
-
-  // Temporary buffer used to receive the file descriptors from recvmsg.
-  // Code that writes into this should immediately read them out and save
-  // them to input_fds_, since this buffer will be re-used anytime we call
-  // recvmsg.
-  char input_cmsg_buf_[kMaxReadFDBuffer];
+  static_assert(kMaxReadFDBuffer <= 8192,
+                "kMaxReadFDBuffer too big for a stack buffer");
 
   // File descriptors extracted from messages coming off of the channel. The
   // handles may span messages and come off different channels from the message
@@ -201,6 +193,10 @@ class IPC_EXPORT ChannelPosix : public Channel,
   // don't change to something like std::deque<> without changing the
   // implementation!
   std::vector<int> input_fds_;
+
+
+  void ResetSafely(base::ScopedFD* fd);
+  bool in_dtor_;
 
 #if defined(OS_MACOSX)
   // On OSX, sent FDs must not be closed until we get an ack.

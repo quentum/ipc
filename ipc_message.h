@@ -5,34 +5,37 @@
 #ifndef IPC_IPC_MESSAGE_H_
 #define IPC_IPC_MESSAGE_H_
 
+#include <stddef.h>
+#include <stdint.h>
+
 #include <string>
 
-#include "base/basictypes.h"
-#include "base/debug/trace_event.h"
+#include "base/gtest_prod_util.h"
+#include "base/memory/ref_counted.h"
 #include "base/pickle.h"
+#include "base/trace_event/trace_event.h"
+#include "build/build_config.h"
+#include "ipc/attachment_broker.h"
+#include "ipc/brokerable_attachment.h"
 #include "ipc/ipc_export.h"
 
 #if !defined(NDEBUG)
 #define IPC_MESSAGE_LOG_ENABLED
 #endif
 
-#if defined(OS_POSIX)
-#include "base/memory/ref_counted.h"
-#endif
-
-namespace base {
-struct FileDescriptor;
-}
-
-class FileDescriptorSet;
-
 namespace IPC {
+
+namespace internal {
+class ChannelReader;
+}  // namespace internal
 
 //------------------------------------------------------------------------------
 
 struct LogData;
+class MessageAttachment;
+class MessageAttachmentSet;
 
-class IPC_EXPORT Message : public Pickle {
+class IPC_EXPORT Message : public base::Pickle {
  public:
   enum PriorityValue {
     PRIORITY_LOW = 1,
@@ -53,13 +56,13 @@ class IPC_EXPORT Message : public Pickle {
     HAS_SENT_TIME_BIT = 0x80,
   };
 
-  virtual ~Message();
+  ~Message() override;
 
   Message();
 
   // Initialize a message with a user-defined type, priority value, and
   // destination WebView ID.
-  Message(int32 routing_id, uint32 type, PriorityValue priority);
+  Message(int32_t routing_id, uint32_t type, PriorityValue priority);
 
   // Initializes a message from a const block of data.  The data is not copied;
   // instead the data is merely referenced by this message.  Only const methods
@@ -129,25 +132,25 @@ class IPC_EXPORT Message : public Pickle {
     return dispatch_error_;
   }
 
-  uint32 type() const {
+  uint32_t type() const {
     return header()->type;
   }
 
-  int32 routing_id() const {
+  int32_t routing_id() const {
     return header()->routing;
   }
 
-  void set_routing_id(int32 new_id) {
+  void set_routing_id(int32_t new_id) {
     header()->routing = new_id;
   }
 
-  uint32 flags() const {
+  uint32_t flags() const {
     return header()->flags;
   }
 
   // Sets all the given header values. The message should be empty at this
   // call.
-  void SetHeaderValues(int32 routing, uint32 type, uint32 flags);
+  void SetHeaderValues(int32_t routing, uint32_t type, uint32_t flags);
 
   template<class T, class S, class P>
   static bool Dispatch(const Message* msg, T* obj, S* sender, P* parameter,
@@ -167,36 +170,82 @@ class IPC_EXPORT Message : public Pickle {
   static void Log(std::string* name, const Message* msg, std::string* l) {
   }
 
-  // Find the end of the message data that starts at range_start.  Returns NULL
-  // if the entire message is not found in the given data range.
-  static const char* FindNext(const char* range_start, const char* range_end) {
-    return Pickle::FindNext(sizeof(Header), range_start, range_end);
-  }
+  // The static method FindNext() returns several pieces of information, which
+  // are aggregated into an instance of this struct.
+  struct IPC_EXPORT NextMessageInfo {
+    NextMessageInfo();
+    ~NextMessageInfo();
 
-#if defined(OS_POSIX)
-  // On POSIX, a message supports reading / writing FileDescriptor objects.
-  // This is used to pass a file descriptor to the peer of an IPC channel.
+    // Total message size. Always valid if |message_found| is true.
+    // If |message_found| is false but we could determine message size
+    // from the header, this field is non-zero. Otherwise it's zero.
+    size_t message_size;
+    // Whether an entire message was found in the given memory range.
+    bool message_found;
+    // Only filled in if |message_found| is true.
+    // The start address is passed into FindNext() by the caller, so isn't
+    // repeated in this struct. The end address of the pickle should be used to
+    // construct a base::Pickle.
+    const char* pickle_end;
+    // Only filled in if |message_found| is true.
+    // The end address of the message should be used to determine the start
+    // address of the next message.
+    const char* message_end;
+    // If the message has brokerable attachments, this vector will contain the
+    // ids of the brokerable attachments. The caller of FindNext() is
+    // responsible for adding the attachments to the message.
+    std::vector<BrokerableAttachment::AttachmentId> attachment_ids;
+  };
 
-  // Add a descriptor to the end of the set. Returns false if the set is full.
-  bool WriteFileDescriptor(const base::FileDescriptor& descriptor);
+  struct SerializedAttachmentIds {
+    void* buffer;
+    size_t size;
+  };
+  // Creates a buffer that contains a serialization of the ids of the brokerable
+  // attachments of the message. This buffer is intended to be sent over the IPC
+  // channel immediately after the pickled message. The caller takes ownership
+  // of the buffer.
+  // This method should only be called if the message has brokerable
+  // attachments.
+  SerializedAttachmentIds SerializedIdsOfBrokerableAttachments();
 
-  // Get a file descriptor from the message. Returns false on error.
-  //   iter: a Pickle iterator to the current location in the message.
-  bool ReadFileDescriptor(PickleIterator* iter,
-                          base::FileDescriptor* descriptor) const;
+  // |info| is an output parameter and must not be nullptr.
+  static void FindNext(const char* range_start,
+                       const char* range_end,
+                       NextMessageInfo* info);
 
-  // Returns true if there are any file descriptors in this message.
-  bool HasFileDescriptors() const;
-#endif
+  // Adds a placeholder brokerable attachment that must be replaced before the
+  // message can be dispatched.
+  bool AddPlaceholderBrokerableAttachmentWithId(
+      BrokerableAttachment::AttachmentId id);
+
+  // WriteAttachment appends |attachment| to the end of the set. It returns
+  // false iff the set is full.
+  bool WriteAttachment(
+      scoped_refptr<base::Pickle::Attachment> attachment) override;
+  // ReadAttachment parses an attachment given the parsing state |iter| and
+  // writes it to |*attachment|. It returns true on success.
+  bool ReadAttachment(
+      base::PickleIterator* iter,
+      scoped_refptr<base::Pickle::Attachment>* attachment) const override;
+  // Returns true if there are any attachment in this message.
+  bool HasAttachments() const override;
+  // Returns true if there are any MojoHandleAttachments in this message.
+  bool HasMojoHandles() const;
+  // Whether the message has any brokerable attachments.
+  bool HasBrokerableAttachments() const;
+
+  void set_sender_pid(base::ProcessId id) { sender_pid_ = id; }
+  base::ProcessId get_sender_pid() const { return sender_pid_; }
 
 #ifdef IPC_MESSAGE_LOG_ENABLED
   // Adds the outgoing time from Time::Now() at the end of the message and sets
   // a bit to indicate that it's been added.
-  void set_sent_time(int64 time);
-  int64 sent_time() const;
+  void set_sent_time(int64_t time);
+  int64_t sent_time() const;
 
-  void set_received_time(int64 time) const;
-  int64 received_time() const { return received_time_; }
+  void set_received_time(int64_t time) const;
+  int64_t received_time() const { return received_time_; }
   void set_output_params(const std::string& op) const { output_params_ = op; }
   const std::string& output_params() const { return output_params_; }
   // The following four functions are needed so we can log sync messages with
@@ -209,33 +258,30 @@ class IPC_EXPORT Message : public Pickle {
   bool dont_log() const { return dont_log_; }
 #endif
 
-  // Called to trace when message is sent.
-  void TraceMessageBegin() {
-    TRACE_EVENT_FLOW_BEGIN0(TRACE_DISABLED_BY_DEFAULT("ipc.flow"), "IPC",
-        header()->flags);
-  }
-  // Called to trace when message is received.
-  void TraceMessageEnd() {
-    TRACE_EVENT_FLOW_END0(TRACE_DISABLED_BY_DEFAULT("ipc.flow"), "IPC",
-        header()->flags);
-  }
-
  protected:
   friend class Channel;
+  friend class ChannelMojo;
   friend class ChannelNacl;
   friend class ChannelPosix;
   friend class ChannelWin;
+  friend class internal::ChannelReader;
   friend class MessageReplyDeserializer;
   friend class SyncMessage;
 
 #pragma pack(push, 4)
-  struct Header : Pickle::Header {
-    int32 routing;  // ID of the view that this message is destined for
-    uint32 type;    // specifies the user-defined message type
-    uint32 flags;   // specifies control flags for the message
+  struct Header : base::Pickle::Header {
+    int32_t routing;  // ID of the view that this message is destined for
+    uint32_t type;    // specifies the user-defined message type
+    uint32_t flags;   // specifies control flags for the message
+#if USE_ATTACHMENT_BROKER
+    // The number of brokered attachments included with this message. The
+    // ids of the brokered attachment ids are sent immediately after the pickled
+    // message, before the next pickled message is sent.
+    uint32_t num_brokered_attachments;
+#endif
 #if defined(OS_POSIX)
-    uint16 num_fds; // the number of descriptors included with this message
-    uint16 pad;     // explicitly initialize this to appease valgrind
+    uint16_t num_fds; // the number of descriptors included with this message
+    uint16_t pad;     // explicitly initialize this to appease valgrind
 #endif
   };
 #pragma pack(pop)
@@ -252,29 +298,34 @@ class IPC_EXPORT Message : public Pickle {
   // Used internally to support IPC::Listener::OnBadMessageReceived.
   mutable bool dispatch_error_;
 
-#if defined(OS_POSIX)
   // The set of file descriptors associated with this message.
-  scoped_refptr<FileDescriptorSet> file_descriptor_set_;
+  scoped_refptr<MessageAttachmentSet> attachment_set_;
 
-  // Ensure that a FileDescriptorSet is allocated
-  void EnsureFileDescriptorSet();
+  // Ensure that a MessageAttachmentSet is allocated
+  void EnsureMessageAttachmentSet();
 
-  FileDescriptorSet* file_descriptor_set() {
-    EnsureFileDescriptorSet();
-    return file_descriptor_set_.get();
+  MessageAttachmentSet* attachment_set() {
+    EnsureMessageAttachmentSet();
+    return attachment_set_.get();
   }
-  const FileDescriptorSet* file_descriptor_set() const {
-    return file_descriptor_set_.get();
+  const MessageAttachmentSet* attachment_set() const {
+    return attachment_set_.get();
   }
-#endif
+
+  // The process id of the sender of the message. This member is populated with
+  // a valid value for every message dispatched to listeners.
+  base::ProcessId sender_pid_;
 
 #ifdef IPC_MESSAGE_LOG_ENABLED
   // Used for logging.
-  mutable int64 received_time_;
+  mutable int64_t received_time_;
   mutable std::string output_params_;
   mutable LogData* log_data_;
   mutable bool dont_log_;
 #endif
+
+  FRIEND_TEST_ALL_PREFIXES(IPCMessageTest, FindNext);
+  FRIEND_TEST_ALL_PREFIXES(IPCMessageTest, FindNextOverflow);
 };
 
 //------------------------------------------------------------------------------
@@ -286,7 +337,7 @@ enum SpecialRoutingIDs {
   MSG_ROUTING_NONE = -2,
 
   // indicates a general message not sent to a particular tab.
-  MSG_ROUTING_CONTROL = kint32max,
+  MSG_ROUTING_CONTROL = INT32_MAX,
 };
 
 #define IPC_REPLY_ID 0xFFFFFFF0  // Special message id for replies

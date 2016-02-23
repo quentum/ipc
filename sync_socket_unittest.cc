@@ -4,13 +4,17 @@
 
 #include "base/sync_socket.h"
 
+#include <stddef.h>
 #include <stdio.h>
-#include <string>
 #include <sstream>
+#include <string>
 
 #include "base/bind.h"
-#include "base/message_loop/message_loop.h"
+#include "base/location.h"
+#include "base/macros.h"
+#include "base/single_thread_task_runner.h"
 #include "base/threading/thread.h"
+#include "build/build_config.h"
 #include "ipc/ipc_test_base.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
@@ -58,7 +62,7 @@ class SyncSocketServerListener : public IPC::Listener {
     chan_ = chan;
   }
 
-  virtual bool OnMessageReceived(const IPC::Message& msg) OVERRIDE {
+  bool OnMessageReceived(const IPC::Message& msg) override {
     if (msg.routing_id() == MSG_ROUTING_CONTROL) {
       IPC_BEGIN_MESSAGE_MAP(SyncSocketServerListener, msg)
         IPC_MESSAGE_HANDLER(MsgClassSetHandle, OnMsgClassSetHandle)
@@ -94,9 +98,7 @@ class SyncSocketServerListener : public IPC::Listener {
 
   // When the client responds, it sends back a shutdown message,
   // which causes the message loop to exit.
-  void OnMsgClassShutdown() {
-    base::MessageLoop::current()->Quit();
-  }
+  void OnMsgClassShutdown() { base::MessageLoop::current()->QuitWhenIdle(); }
 
   IPC::Channel* chan_;
 
@@ -109,8 +111,7 @@ MULTIPROCESS_IPC_TEST_CLIENT_MAIN(SyncSocketServerClient) {
   base::MessageLoopForIO main_message_loop;
   SyncSocketServerListener listener;
   scoped_ptr<IPC::Channel> channel(IPC::Channel::CreateClient(
-      IPCTestBase::GetChannelName("SyncSocketServerClient"),
-      &listener));
+      IPCTestBase::GetChannelName("SyncSocketServerClient"), &listener));
   EXPECT_TRUE(channel->Connect());
   listener.Init(channel.get());
   base::MessageLoop::current()->Run();
@@ -129,7 +130,7 @@ class SyncSocketClientListener : public IPC::Listener {
     chan_ = chan;
   }
 
-  virtual bool OnMessageReceived(const IPC::Message& msg) OVERRIDE {
+  bool OnMessageReceived(const IPC::Message& msg) override {
     if (msg.routing_id() == MSG_ROUTING_CONTROL) {
       IPC_BEGIN_MESSAGE_MAP(SyncSocketClientListener, msg)
         IPC_MESSAGE_HANDLER(MsgClassResponse, OnMsgClassResponse)
@@ -153,7 +154,7 @@ class SyncSocketClientListener : public IPC::Listener {
     EXPECT_EQ(0U, socket_->Peek());
     IPC::Message* msg = new MsgClassShutdown();
     EXPECT_TRUE(chan_->Send(msg));
-    base::MessageLoop::current()->Quit();
+    base::MessageLoop::current()->QuitWhenIdle();
   }
 
   base::SyncSocket* socket_;
@@ -165,7 +166,12 @@ class SyncSocketClientListener : public IPC::Listener {
 class SyncSocketTest : public IPCTestBase {
 };
 
-TEST_F(SyncSocketTest, SanityTest) {
+#if defined(OS_ANDROID)
+#define MAYBE_SanityTest DISABLED_SanityTest
+#else
+#define MAYBE_SanityTest SanityTest
+#endif
+TEST_F(SyncSocketTest, MAYBE_SanityTest) {
   Init("SyncSocketServerClient");
 
   SyncSocketClientListener listener;
@@ -184,7 +190,7 @@ TEST_F(SyncSocketTest, SanityTest) {
 #if defined(OS_WIN)
   // On windows we need to duplicate the handle into the server process.
   BOOL retval = DuplicateHandle(GetCurrentProcess(), pair[1].handle(),
-                                client_process(), &target_handle,
+                                client_process().Handle(), &target_handle,
                                 0, FALSE, DUPLICATE_SAME_ACCESS);
   EXPECT_TRUE(retval);
   // Set up a message to pass the handle to the server.
@@ -227,7 +233,8 @@ TEST_F(SyncSocketTest, DisconnectTest) {
   // Try to do a blocking read from one of the sockets on the worker thread.
   char buf[0xff];
   size_t received = 1U;  // Initialize to an unexpected value.
-  worker.message_loop()->PostTask(FROM_HERE,
+  worker.task_runner()->PostTask(
+      FROM_HERE,
       base::Bind(&BlockingRead, &pair[0], &buf[0], arraysize(buf), &received));
 
   // Wait for the worker thread to say hello.
@@ -246,8 +253,13 @@ TEST_F(SyncSocketTest, DisconnectTest) {
   EXPECT_EQ(0U, received);
 }
 
+#if defined(OS_ANDROID)
+#define MAYBE_BlockingReceiveTest DISABLED_BlockingReceiveTest
+#else
+#define MAYBE_BlockingReceiveTest BlockingReceiveTest
+#endif
 // Tests that read is a blocking operation.
-TEST_F(SyncSocketTest, BlockingReceiveTest) {
+TEST_F(SyncSocketTest, MAYBE_BlockingReceiveTest) {
   base::CancelableSyncSocket pair[2];
   ASSERT_TRUE(base::CancelableSyncSocket::CreatePair(&pair[0], &pair[1]));
 
@@ -257,9 +269,9 @@ TEST_F(SyncSocketTest, BlockingReceiveTest) {
   // Try to do a blocking read from one of the sockets on the worker thread.
   char buf[kHelloStringLength] = {0};
   size_t received = 1U;  // Initialize to an unexpected value.
-  worker.message_loop()->PostTask(FROM_HERE,
-      base::Bind(&BlockingRead, &pair[0], &buf[0],
-                 kHelloStringLength, &received));
+  worker.task_runner()->PostTask(FROM_HERE,
+                                 base::Bind(&BlockingRead, &pair[0], &buf[0],
+                                            kHelloStringLength, &received));
 
   // Wait for the worker thread to say hello.
   char hello[kHelloStringLength] = {0};

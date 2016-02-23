@@ -28,6 +28,13 @@
           '..',
         ],
       },
+      'conditions': [
+        ['OS == "win" or OS == "mac"', {
+          'dependencies': [
+            '../crypto/crypto.gyp:crypto',
+          ],
+        }],
+      ],
     },
     {
       'target_name': 'ipc_tests',
@@ -38,25 +45,31 @@
         '../base/base.gyp:base',
         '../base/base.gyp:base_i18n',
         '../base/base.gyp:test_support_base',
+        '../crypto/crypto.gyp:crypto',
         '../testing/gtest.gyp:gtest',
       ],
       'include_dirs': [
         '..'
       ],
       'sources': [
-        'file_descriptor_set_posix_unittest.cc',
+        'attachment_broker_mac_unittest.cc',
+        'attachment_broker_privileged_mac_unittest.cc',
+        'attachment_broker_privileged_win_unittest.cc',
         'ipc_channel_posix_unittest.cc',
         'ipc_channel_proxy_unittest.cc',
+        'ipc_channel_reader_unittest.cc',
         'ipc_channel_unittest.cc',
         'ipc_fuzzing_tests.cc',
+        'ipc_message_attachment_set_posix_unittest.cc',
         'ipc_message_unittest.cc',
         'ipc_message_utils_unittest.cc',
         'ipc_send_fds_test.cc',
         'ipc_sync_channel_unittest.cc',
         'ipc_sync_message_unittest.cc',
         'ipc_sync_message_unittest.h',
-        'ipc_test_base.cc',
-        'ipc_test_base.h',
+        'ipc_test_messages.h',
+        'ipc_test_message_generator.cc',
+        'ipc_test_message_generator.h',
         'run_all_unittests.cc',
         'sync_socket_unittest.cc',
         'unix_domain_socket_util_unittest.cc',
@@ -68,19 +81,14 @@
           ],
         }],
         ['OS == "android"', {
+          'sources!': [
+            # These multiprocess tests don't work on Android.
+            'ipc_channel_unittest.cc',
+          ],
           'dependencies': [
             '../testing/android/native_test.gyp:native_test_native_code',
           ],
         }],
-        ['os_posix == 1 and OS != "mac" and OS != "android"', {
-          'conditions': [
-            ['use_allocator!="none"', {
-              'dependencies': [
-                '../base/allocator/allocator.gyp:allocator',
-              ],
-            }],
-          ],
-        }]
       ],
     },
     {
@@ -110,15 +118,6 @@
             '../testing/android/native_test.gyp:native_test_native_code',
           ],
         }],
-        ['os_posix == 1 and OS != "mac" and OS != "android"', {
-          'conditions': [
-            ['use_allocator!="none"', {
-              'dependencies': [
-                '../base/allocator/allocator.gyp:allocator',
-              ],
-            }],
-          ],
-        }]
       ],
     },
     {
@@ -132,8 +131,18 @@
       'sources': [
         'ipc_multiprocess_test.cc',
         'ipc_multiprocess_test.h',
+        'ipc_perftest_support.cc',
+        'ipc_perftest_support.h',
+        'ipc_security_test_util.cc',
+        'ipc_security_test_util.h',
+        'ipc_test_base.cc',
+        'ipc_test_base.h',
+        'ipc_test_channel_listener.cc',
+        'ipc_test_channel_listener.h',
         'ipc_test_sink.cc',
         'ipc_test_sink.h',
+        'test_util_mac.cc',
+        'test_util_mac.h',
       ],
     },
   ],
@@ -151,6 +160,7 @@
             # TODO(viettrungluu): Needed for base/lazy_instance.h, which is
             # suspect.
             '../base/third_party/dynamic_annotations/dynamic_annotations.gyp:dynamic_annotations_win64',
+            '../crypto/crypto.gyp:crypto_nacl_win64',
           ],
           # TODO(gregoryd): direct_dependent_settings should be shared with the
           # 32-bit target, but it doesn't work due to a bug in gyp
@@ -190,7 +200,44 @@
             'test_suite_name': 'ipc_perftests',
           },
           'includes': [ '../build/apk_test.gypi' ],
+        }
+      ],
+      'conditions': [
+        ['test_isolation_mode != "noop"', {
+          'targets': [
+            {
+              'target_name': 'ipc_tests_apk_run',
+              'type': 'none',
+              'dependencies': [
+                'ipc_tests_apk',
+              ],
+              'includes': [
+                '../build/isolate.gypi',
+              ],
+              'sources': [
+                'ipc_tests_apk.isolate',
+              ],
+            },
+          ],
         }],
+      ],
+    }],
+    ['test_isolation_mode != "noop" and OS != "android"', {
+      'targets': [
+        {
+          'target_name': 'ipc_tests_run',
+          'type': 'none',
+          'dependencies': [
+            'ipc_tests',
+          ],
+          'includes': [
+            '../build/isolate.gypi',
+          ],
+          'sources': [
+            'ipc_tests.isolate',
+          ],
+        },
+      ],
     }],
   ],
 }

@@ -5,6 +5,8 @@
 #include "ipc/ipc_channel_win.h"
 
 #include <windows.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #include "base/auto_reset.h"
 #include "base/bind.h"
@@ -17,30 +19,11 @@
 #include "base/strings/utf_string_conversions.h"
 #include "base/threading/thread_checker.h"
 #include "base/win/scoped_handle.h"
+#include "ipc/attachment_broker.h"
 #include "ipc/ipc_listener.h"
 #include "ipc/ipc_logging.h"
+#include "ipc/ipc_message_attachment_set.h"
 #include "ipc/ipc_message_utils.h"
-
-namespace {
-
-enum DebugFlags {
-  INIT_DONE = 1 << 0,
-  CALLED_CONNECT = 1 << 1,
-  PENDING_CONNECT = 1 << 2,
-  CONNECT_COMPLETED = 1 << 3,
-  PIPE_CONNECTED = 1 << 4,
-  WRITE_MSG = 1 << 5,
-  READ_MSG = 1 << 6,
-  WRITE_COMPLETED = 1 << 7,
-  READ_COMPLETED = 1 << 8,
-  CLOSED = 1 << 9,
-  WAIT_FOR_READ = 1 << 10,
-  WAIT_FOR_WRITE = 1 << 11,
-  WAIT_FOR_READ_COMPLETE = 1 << 12,
-  WAIT_FOR_WRITE_COMPLETE = 1 << 13
-};
-
-}  // namespace
 
 namespace IPC {
 
@@ -50,62 +33,52 @@ ChannelWin::State::State(ChannelWin* channel) : is_pending(false) {
 }
 
 ChannelWin::State::~State() {
-  COMPILE_ASSERT(!offsetof(ChannelWin::State, context),
-                 starts_with_io_context);
+  static_assert(offsetof(ChannelWin::State, context) == 0,
+                "ChannelWin::State should have context as its first data"
+                "member.");
 }
 
-ChannelWin::ChannelWin(const IPC::ChannelHandle &channel_handle,
-                       Mode mode, Listener* listener)
+ChannelWin::ChannelWin(const IPC::ChannelHandle& channel_handle,
+                       Mode mode,
+                       Listener* listener)
     : ChannelReader(listener),
       input_state_(this),
       output_state_(this),
-      pipe_(INVALID_HANDLE_VALUE),
       peer_pid_(base::kNullProcessId),
       waiting_connect_(mode & MODE_SERVER_FLAG),
       processing_incoming_(false),
-      weak_factory_(this),
       validate_client_(false),
-      debug_flags_(0),
-      client_secret_(0) {
+      client_secret_(0),
+      weak_factory_(this) {
   CreatePipe(channel_handle, mode);
 }
 
 ChannelWin::~ChannelWin() {
+  CleanUp();
   Close();
 }
 
 void ChannelWin::Close() {
-  if (thread_check_.get()) {
+  if (thread_check_.get())
     DCHECK(thread_check_->CalledOnValidThread());
-  }
-  debug_flags_ |= CLOSED;
 
   if (input_state_.is_pending || output_state_.is_pending)
-    CancelIo(pipe_);
+    CancelIo(pipe_.Get());
 
   // Closing the handle at this point prevents us from issuing more requests
   // form OnIOCompleted().
-  if (pipe_ != INVALID_HANDLE_VALUE) {
-    CloseHandle(pipe_);
-    pipe_ = INVALID_HANDLE_VALUE;
-  }
-
-  if (input_state_.is_pending)
-    debug_flags_ |= WAIT_FOR_READ;
-
-  if (output_state_.is_pending)
-    debug_flags_ |= WAIT_FOR_WRITE;
+  if (pipe_.IsValid())
+    pipe_.Close();
 
   // Make sure all IO has completed.
-  base::Time start = base::Time::Now();
   while (input_state_.is_pending || output_state_.is_pending) {
     base::MessageLoopForIO::current()->WaitForIOCompletion(INFINITE, this);
   }
 
   while (!output_queue_.empty()) {
-    Message* m = output_queue_.front();
+    OutputElement* element = output_queue_.front();
     output_queue_.pop();
-    delete m;
+    delete element;
   }
 }
 
@@ -115,12 +88,58 @@ bool ChannelWin::Send(Message* message) {
            << " with type " << message->type()
            << " (" << output_queue_.size() << " in queue)";
 
+  if (!prelim_queue_.empty()) {
+    prelim_queue_.push(message);
+    return true;
+  }
+
+  if (message->HasBrokerableAttachments() &&
+      peer_pid_ == base::kNullProcessId) {
+    prelim_queue_.push(message);
+    return true;
+  }
+
+  return ProcessMessageForDelivery(message);
+}
+
+bool ChannelWin::ProcessMessageForDelivery(Message* message) {
+  // Sending a brokerable attachment requires a call to Channel::Send(), so
+  // both Send() and ProcessMessageForDelivery() may be re-entrant.
+  if (message->HasBrokerableAttachments()) {
+    DCHECK(GetAttachmentBroker());
+    DCHECK(peer_pid_ != base::kNullProcessId);
+    for (const scoped_refptr<IPC::BrokerableAttachment>& attachment :
+         message->attachment_set()->GetBrokerableAttachments()) {
+      if (!GetAttachmentBroker()->SendAttachmentToProcess(attachment,
+                                                          peer_pid_)) {
+        delete message;
+        return false;
+      }
+    }
+  }
+
 #ifdef IPC_MESSAGE_LOG_ENABLED
   Logging::GetInstance()->OnSendMessage(message, "");
 #endif
 
-  message->TraceMessageBegin();
-  output_queue_.push(message);
+  TRACE_EVENT_WITH_FLOW0(TRACE_DISABLED_BY_DEFAULT("ipc.flow"),
+                         "ChannelWin::ProcessMessageForDelivery",
+                         message->flags(),
+                         TRACE_EVENT_FLAG_FLOW_OUT);
+
+  // |output_queue_| takes ownership of |message|.
+  OutputElement* element = new OutputElement(message);
+  output_queue_.push(element);
+
+#if USE_ATTACHMENT_BROKER
+  if (message->HasBrokerableAttachments()) {
+    // |output_queue_| takes ownership of |ids.buffer|.
+    Message::SerializedAttachmentIds ids =
+        message->SerializedIdsOfBrokerableAttachments();
+    output_queue_.push(new OutputElement(ids.buffer, ids.size));
+  }
+#endif
+
   // ensure waiting to write
   if (!waiting_connect_) {
     if (!output_state_.is_pending) {
@@ -132,8 +151,41 @@ bool ChannelWin::Send(Message* message) {
   return true;
 }
 
+void ChannelWin::FlushPrelimQueue() {
+  DCHECK_NE(peer_pid_, base::kNullProcessId);
+
+  // Due to the possibly re-entrant nature of ProcessMessageForDelivery(), it
+  // is critical that |prelim_queue_| appears empty.
+  std::queue<Message*> prelim_queue;
+  prelim_queue_.swap(prelim_queue);
+
+  while (!prelim_queue.empty()) {
+    Message* m = prelim_queue.front();
+    bool success = ProcessMessageForDelivery(m);
+    prelim_queue.pop();
+
+    if (!success)
+      break;
+  }
+
+  // Delete any unprocessed messages.
+  while (!prelim_queue.empty()) {
+    Message* m = prelim_queue.front();
+    delete m;
+    prelim_queue.pop();
+  }
+}
+
+AttachmentBroker* ChannelWin::GetAttachmentBroker() {
+  return AttachmentBroker::GetGlobal();
+}
+
 base::ProcessId ChannelWin::GetPeerPID() const {
   return peer_pid_;
+}
+
+base::ProcessId ChannelWin::GetSelfPID() const {
+  return GetCurrentProcessId();
 }
 
 // static
@@ -150,12 +202,11 @@ ChannelWin::ReadState ChannelWin::ReadData(
     char* buffer,
     int buffer_len,
     int* /* bytes_read */) {
-  if (INVALID_HANDLE_VALUE == pipe_)
+  if (!pipe_.IsValid())
     return READ_FAILED;
 
-  debug_flags_ |= READ_MSG;
   DWORD bytes_read = 0;
-  BOOL ok = ReadFile(pipe_, buffer, buffer_len,
+  BOOL ok = ReadFile(pipe_.Get(), buffer, buffer_len,
                      &bytes_read, &input_state_.context.overlapped);
   if (!ok) {
     DWORD err = GetLastError();
@@ -179,22 +230,26 @@ ChannelWin::ReadState ChannelWin::ReadData(
   return READ_PENDING;
 }
 
-bool ChannelWin::WillDispatchInputMessage(Message* msg) {
+bool ChannelWin::ShouldDispatchInputMessage(Message* msg) {
   // Make sure we get a hello when client validation is required.
   if (validate_client_)
     return IsHelloMessage(*msg);
   return true;
 }
 
+bool ChannelWin::GetNonBrokeredAttachments(Message* msg) {
+  return true;
+}
+
 void ChannelWin::HandleInternalMessage(const Message& msg) {
   DCHECK_EQ(msg.type(), static_cast<unsigned>(Channel::HELLO_MESSAGE_TYPE));
   // The hello message contains one parameter containing the PID.
-  PickleIterator it(msg);
-  int32 claimed_pid;
+  base::PickleIterator it(msg);
+  int32_t claimed_pid;
   bool failed = !it.ReadInt(&claimed_pid);
 
   if (!failed && validate_client_) {
-    int32 secret;
+    int32_t secret;
     failed = it.ReadInt(&secret) ? (secret != client_secret_) : true;
   }
 
@@ -208,7 +263,18 @@ void ChannelWin::HandleInternalMessage(const Message& msg) {
   peer_pid_ = claimed_pid;
   // Validation completed.
   validate_client_ = false;
+
   listener()->OnChannelConnected(claimed_pid);
+
+  FlushPrelimQueue();
+}
+
+base::ProcessId ChannelWin::GetSenderPID() {
+  return GetPeerPID();
+}
+
+bool ChannelWin::IsAttachmentBrokerEndpoint() {
+  return is_attachment_broker_endpoint();
 }
 
 bool ChannelWin::DidEmptyInputBuffers() {
@@ -217,8 +283,8 @@ bool ChannelWin::DidEmptyInputBuffers() {
 }
 
 // static
-const base::string16 ChannelWin::PipeName(
-    const std::string& channel_id, int32* secret) {
+const base::string16 ChannelWin::PipeName(const std::string& channel_id,
+                                          int32_t* secret) {
   std::string name("\\\\.\\pipe\\chrome.");
 
   // Prevent the shared secret from ending up in the pipe name.
@@ -226,21 +292,25 @@ const base::string16 ChannelWin::PipeName(
   if (index != std::string::npos) {
     if (secret)  // Retrieve the secret if asked for.
       base::StringToInt(channel_id.substr(index + 1), secret);
-    return base::ASCIIToWide(name.append(channel_id.substr(0, index - 1)));
+    return base::ASCIIToUTF16(name.append(channel_id.substr(0, index - 1)));
   }
 
   // This case is here to support predictable named pipes in tests.
   if (secret)
     *secret = 0;
-  return base::ASCIIToWide(name.append(channel_id));
+  return base::ASCIIToUTF16(name.append(channel_id));
 }
 
 bool ChannelWin::CreatePipe(const IPC::ChannelHandle &channel_handle,
-                                      Mode mode) {
-  DCHECK_EQ(INVALID_HANDLE_VALUE, pipe_);
+                            Mode mode) {
+  DCHECK(!pipe_.IsValid());
   base::string16 pipe_name;
   // If we already have a valid pipe for channel just copy it.
   if (channel_handle.pipe.handle) {
+    // TODO(rvargas) crbug.com/415294: ChannelHandle should either go away in
+    // favor of two independent entities (name/file), or it should be a move-
+    // only type with a base::File member. In any case, this code should not
+    // call DuplicateHandle.
     DCHECK(channel_handle.name.empty());
     pipe_name = L"Not Available";  // Just used for LOG
     // Check that the given pipe confirms to the specified mode.  We can
@@ -254,46 +324,48 @@ bool ChannelWin::CreatePipe(const IPC::ChannelHandle &channel_handle,
       LOG(WARNING) << "Inconsistent open mode. Mode :" << mode;
       return false;
     }
+    HANDLE local_handle;
     if (!DuplicateHandle(GetCurrentProcess(),
                          channel_handle.pipe.handle,
                          GetCurrentProcess(),
-                         &pipe_,
+                         &local_handle,
                          0,
                          FALSE,
                          DUPLICATE_SAME_ACCESS)) {
       LOG(WARNING) << "DuplicateHandle failed. Error :" << GetLastError();
       return false;
     }
+    pipe_.Set(local_handle);
   } else if (mode & MODE_SERVER_FLAG) {
     DCHECK(!channel_handle.pipe.handle);
     const DWORD open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
                             FILE_FLAG_FIRST_PIPE_INSTANCE;
     pipe_name = PipeName(channel_handle.name, &client_secret_);
     validate_client_ = !!client_secret_;
-    pipe_ = CreateNamedPipeW(pipe_name.c_str(),
-                             open_mode,
-                             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
-                             1,
-                             Channel::kReadBufferSize,
-                             Channel::kReadBufferSize,
-                             5000,
-                             NULL);
+    pipe_.Set(CreateNamedPipeW(pipe_name.c_str(),
+                               open_mode,
+                               PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
+                               1,
+                               Channel::kReadBufferSize,
+                               Channel::kReadBufferSize,
+                               5000,
+                               NULL));
   } else if (mode & MODE_CLIENT_FLAG) {
     DCHECK(!channel_handle.pipe.handle);
     pipe_name = PipeName(channel_handle.name, &client_secret_);
-    pipe_ = CreateFileW(pipe_name.c_str(),
-                        GENERIC_READ | GENERIC_WRITE,
-                        0,
-                        NULL,
-                        OPEN_EXISTING,
-                        SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION |
-                            FILE_FLAG_OVERLAPPED,
-                        NULL);
+    pipe_.Set(CreateFileW(pipe_name.c_str(),
+                          GENERIC_READ | GENERIC_WRITE,
+                          0,
+                          NULL,
+                          OPEN_EXISTING,
+                          SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS |
+                              FILE_FLAG_OVERLAPPED,
+                          NULL));
   } else {
     NOTREACHED();
   }
 
-  if (pipe_ == INVALID_HANDLE_VALUE) {
+  if (!pipe_.IsValid()) {
     // If this process is being closed, the pipe may be gone already.
     PLOG(WARNING) << "Unable to create pipe \"" << pipe_name << "\" in "
                   << (mode & MODE_SERVER_FLAG ? "server" : "client") << " mode";
@@ -307,17 +379,15 @@ bool ChannelWin::CreatePipe(const IPC::ChannelHandle &channel_handle,
 
   // Don't send the secret to the untrusted process, and don't send a secret
   // if the value is zero (for IPC backwards compatability).
-  int32 secret = validate_client_ ? 0 : client_secret_;
+  int32_t secret = validate_client_ ? 0 : client_secret_;
   if (!m->WriteInt(GetCurrentProcessId()) ||
       (secret && !m->WriteUInt32(secret))) {
-    CloseHandle(pipe_);
-    pipe_ = INVALID_HANDLE_VALUE;
+    pipe_.Close();
     return false;
   }
 
-  debug_flags_ |= INIT_DONE;
-
-  output_queue_.push(m.release());
+  OutputElement* element = new OutputElement(m.release());
+  output_queue_.push(element);
   return true;
 }
 
@@ -327,10 +397,10 @@ bool ChannelWin::Connect() {
   if (!thread_check_.get())
     thread_check_.reset(new base::ThreadChecker());
 
-  if (pipe_ == INVALID_HANDLE_VALUE)
+  if (!pipe_.IsValid())
     return false;
 
-  base::MessageLoopForIO::current()->RegisterIOHandler(pipe_, this);
+  base::MessageLoopForIO::current()->RegisterIOHandler(pipe_.Get(), this);
 
   // Check to see if there is a client connected to our pipe...
   if (waiting_connect_)
@@ -360,12 +430,10 @@ bool ChannelWin::ProcessConnection() {
     input_state_.is_pending = false;
 
   // Do we have a client connected to our pipe?
-  if (INVALID_HANDLE_VALUE == pipe_)
+  if (!pipe_.IsValid())
     return false;
 
-  BOOL ok = ConnectNamedPipe(pipe_, &input_state_.context.overlapped);
-  debug_flags_ |= CALLED_CONNECT;
-
+  BOOL ok = ConnectNamedPipe(pipe_.Get(), &input_state_.context.overlapped);
   DWORD err = GetLastError();
   if (ok) {
     // Uhm, the API documentation says that this function should never
@@ -377,10 +445,8 @@ bool ChannelWin::ProcessConnection() {
   switch (err) {
   case ERROR_IO_PENDING:
     input_state_.is_pending = true;
-    debug_flags_ |= PENDING_CONNECT;
     break;
   case ERROR_PIPE_CONNECTED:
-    debug_flags_ |= PIPE_CONNECTED;
     waiting_connect_ = false;
     break;
   case ERROR_NO_DATA:
@@ -411,42 +477,47 @@ bool ChannelWin::ProcessOutgoingMessages(
     }
     // Message was sent.
     CHECK(!output_queue_.empty());
-    Message* m = output_queue_.front();
+    OutputElement* element = output_queue_.front();
     output_queue_.pop();
-    delete m;
+    delete element;
   }
 
   if (output_queue_.empty())
     return true;
 
-  if (INVALID_HANDLE_VALUE == pipe_)
+  if (!pipe_.IsValid())
     return false;
 
   // Write to pipe...
-  Message* m = output_queue_.front();
-  DCHECK(m->size() <= INT_MAX);
-  debug_flags_ |= WRITE_MSG;
-  BOOL ok = WriteFile(pipe_,
-                      m->data(),
-                      static_cast<int>(m->size()),
-                      &bytes_written,
+  OutputElement* element = output_queue_.front();
+  DCHECK(element->size() <= INT_MAX);
+  BOOL ok = WriteFile(pipe_.Get(),
+                      element->data(),
+                      static_cast<uint32_t>(element->size()),
+                      NULL,
                       &output_state_.context.overlapped);
   if (!ok) {
-    DWORD err = GetLastError();
-    if (err == ERROR_IO_PENDING) {
+    DWORD write_error = GetLastError();
+    if (write_error == ERROR_IO_PENDING) {
       output_state_.is_pending = true;
 
-      DVLOG(2) << "sent pending message @" << m << " on channel @" << this
-               << " with type " << m->type();
+      const Message* m = element->get_message();
+      if (m) {
+        DVLOG(2) << "sent pending message @" << m << " on channel @" << this
+                 << " with type " << m->type();
+      }
 
       return true;
     }
-    LOG(ERROR) << "pipe error: " << err;
+    LOG(ERROR) << "pipe error: " << write_error;
     return false;
   }
 
-  DVLOG(2) << "sent message @" << m << " on channel @" << this
-           << " with type " << m->type();
+  const Message* m = element->get_message();
+  if (m) {
+    DVLOG(2) << "sent message @" << m << " on channel @" << this
+             << " with type " << m->type();
+  }
 
   output_state_.is_pending = true;
   return true;
@@ -460,7 +531,6 @@ void ChannelWin::OnIOCompleted(
   DCHECK(thread_check_->CalledOnValidThread());
   if (context == &input_state_.context) {
     if (waiting_connect_) {
-      debug_flags_ |= CONNECT_COMPLETED;
       if (!ProcessConnection())
         return;
       // We may have some messages queued up to send...
@@ -479,33 +549,25 @@ void ChannelWin::OnIOCompleted(
     // Process the new data.
     if (input_state_.is_pending) {
       // This is the normal case for everything except the initialization step.
-      debug_flags_ |= READ_COMPLETED;
-      if (debug_flags_ & WAIT_FOR_READ) {
-        CHECK(!(debug_flags_ & WAIT_FOR_READ_COMPLETE));
-        debug_flags_ |= WAIT_FOR_READ_COMPLETE;
-      }
       input_state_.is_pending = false;
-      if (!bytes_transfered)
+      if (!bytes_transfered) {
         ok = false;
-      else if (pipe_ != INVALID_HANDLE_VALUE)
-        ok = AsyncReadComplete(bytes_transfered);
+      } else if (pipe_.IsValid()) {
+        ok = (AsyncReadComplete(bytes_transfered) != DISPATCH_ERROR);
+      }
     } else {
       DCHECK(!bytes_transfered);
     }
 
     // Request more data.
     if (ok)
-      ok = ProcessIncomingMessages();
+      ok = (ProcessIncomingMessages() != DISPATCH_ERROR);
   } else {
     DCHECK(context == &output_state_.context);
-    debug_flags_ |= WRITE_COMPLETED;
-    if (debug_flags_ & WAIT_FOR_WRITE) {
-      CHECK(!(debug_flags_ & WAIT_FOR_WRITE_COMPLETE));
-      debug_flags_ |= WAIT_FOR_WRITE_COMPLETE;
-    }
+    CHECK(output_state_.is_pending);
     ok = ProcessOutgoingMessages(context, bytes_transfered);
   }
-  if (!ok && INVALID_HANDLE_VALUE != pipe_) {
+  if (!ok && pipe_.IsValid()) {
     // We don't want to re-enter Close().
     Close();
     listener()->OnChannelError();
@@ -516,10 +578,10 @@ void ChannelWin::OnIOCompleted(
 // Channel's methods
 
 // static
-scoped_ptr<Channel> Channel::Create(
-    const IPC::ChannelHandle &channel_handle, Mode mode, Listener* listener) {
-  return scoped_ptr<Channel>(
-      new ChannelWin(channel_handle, mode, listener));
+scoped_ptr<Channel> Channel::Create(const IPC::ChannelHandle& channel_handle,
+                                    Mode mode,
+                                    Listener* listener) {
+  return scoped_ptr<Channel>(new ChannelWin(channel_handle, mode, listener));
 }
 
 // static

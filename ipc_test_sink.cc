@@ -4,6 +4,10 @@
 
 #include "ipc/ipc_test_sink.h"
 
+#include <stddef.h>
+#include <stdint.h>
+
+#include "build/build_config.h"
 #include "ipc/ipc_listener.h"
 #include "ipc/ipc_message.h"
 
@@ -35,9 +39,13 @@ base::ProcessId TestSink::GetPeerPID() const {
   return base::ProcessId();
 }
 
+base::ProcessId TestSink::GetSelfPID() const {
+  NOTIMPLEMENTED();
+  return base::ProcessId();
+}
 
 bool TestSink::OnMessageReceived(const Message& msg) {
-  ObserverListBase<Listener>::Iterator it(filter_list_);
+  base::ObserverListBase<Listener>::Iterator it(&filter_list_);
   Listener* observer;
   while ((observer = it.GetNext()) != NULL) {
     if (observer->OnMessageReceived(msg))
@@ -59,7 +67,7 @@ const Message* TestSink::GetMessageAt(size_t index) const {
   return &messages_[index];
 }
 
-const Message* TestSink::GetFirstMessageMatching(uint32 id) const {
+const Message* TestSink::GetFirstMessageMatching(uint32_t id) const {
   for (size_t i = 0; i < messages_.size(); i++) {
     if (messages_[i].type() == id)
       return &messages_[i];
@@ -67,7 +75,7 @@ const Message* TestSink::GetFirstMessageMatching(uint32 id) const {
   return NULL;
 }
 
-const Message* TestSink::GetUniqueMessageMatching(uint32 id) const {
+const Message* TestSink::GetUniqueMessageMatching(uint32_t id) const {
   size_t found_index = 0;
   size_t found_count = 0;
   for (size_t i = 0; i < messages_.size(); i++) {
@@ -96,9 +104,9 @@ int TestSink::GetClientFileDescriptor() const {
   return -1;
 }
 
-int TestSink::TakeClientFileDescriptor() {
+base::ScopedFD TestSink::TakeClientFileDescriptor() {
   NOTREACHED();
-  return -1;
+  return base::ScopedFD();
 }
 
 #endif  // defined(OS_POSIX) && !defined(OS_NACL)

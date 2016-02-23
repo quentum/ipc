@@ -4,13 +4,20 @@
 
 #include "ipc/ipc_channel_proxy.h"
 
+#include <stddef.h>
+#include <stdint.h>
+#include <utility>
+
 #include "base/bind.h"
 #include "base/compiler_specific.h"
 #include "base/location.h"
 #include "base/memory/ref_counted.h"
 #include "base/memory/scoped_ptr.h"
+#include "base/profiler/scoped_tracker.h"
 #include "base/single_thread_task_runner.h"
 #include "base/thread_task_runner_handle.h"
+#include "build/build_config.h"
+#include "ipc/ipc_channel_factory.h"
 #include "ipc/ipc_listener.h"
 #include "ipc/ipc_logging.h"
 #include "ipc/ipc_message_macros.h"
@@ -21,14 +28,17 @@ namespace IPC {
 
 //------------------------------------------------------------------------------
 
-ChannelProxy::Context::Context(Listener* listener,
-                               base::SingleThreadTaskRunner* ipc_task_runner)
+ChannelProxy::Context::Context(
+    Listener* listener,
+    const scoped_refptr<base::SingleThreadTaskRunner>& ipc_task_runner)
     : listener_task_runner_(base::ThreadTaskRunnerHandle::Get()),
       listener_(listener),
       ipc_task_runner_(ipc_task_runner),
       channel_connected_called_(false),
+      channel_send_thread_safe_(false),
       message_filter_router_(new MessageFilterRouter()),
-      peer_pid_(base::kNullProcessId) {
+      peer_pid_(base::kNullProcessId),
+      attachment_broker_endpoint_(false) {
   DCHECK(ipc_task_runner_.get());
   // The Listener thread where Messages are handled must be a separate thread
   // to avoid oversubscribing the IO thread. If you trigger this error, you
@@ -48,11 +58,13 @@ void ChannelProxy::Context::ClearIPCTaskRunner() {
   ipc_task_runner_ = NULL;
 }
 
-void ChannelProxy::Context::CreateChannel(const IPC::ChannelHandle& handle,
-                                          const Channel::Mode& mode) {
+void ChannelProxy::Context::CreateChannel(scoped_ptr<ChannelFactory> factory) {
+  base::AutoLock l(channel_lifetime_lock_);
   DCHECK(!channel_);
-  channel_id_ = handle.name;
-  channel_ = Channel::Create(handle, mode, this);
+  channel_id_ = factory->GetName();
+  channel_ = factory->BuildChannel(this);
+  channel_send_thread_safe_ = channel_->IsSendThreadSafe();
+  channel_->SetAttachmentBrokerEndpoint(attachment_broker_endpoint_);
 }
 
 bool ChannelProxy::Context::TryFilters(const Message& message) {
@@ -93,7 +105,7 @@ bool ChannelProxy::Context::OnMessageReceivedNoFilter(const Message& message) {
 }
 
 // Called on the IPC::Channel thread
-void ChannelProxy::Context::OnChannelConnected(int32 peer_pid) {
+void ChannelProxy::Context::OnChannelConnected(int32_t peer_pid) {
   // We cache off the peer_pid so it can be safely accessed from both threads.
   peer_pid_ = channel_->GetPeerPID();
 
@@ -137,6 +149,10 @@ void ChannelProxy::Context::OnChannelOpened() {
 
 // Called on the IPC::Channel thread
 void ChannelProxy::Context::OnChannelClosed() {
+  // TODO(pkasting): Remove ScopedTracker below once crbug.com/477117 is fixed.
+  tracked_objects::ScopedTracker tracking_profile(
+      FROM_HERE_WITH_EXPLICIT_FUNCTION(
+          "477117 ChannelProxy::Context::OnChannelClosed"));
   // It's okay for IPC::ChannelProxy::Close to be called more than once, which
   // would result in this branch being taken.
   if (!channel_)
@@ -154,7 +170,7 @@ void ChannelProxy::Context::OnChannelClosed() {
   // access it any more.
   pending_filters_.clear();
 
-  channel_.reset();
+  ClearChannel();
 
   // Balance with the reference taken during startup.  This may result in
   // self-destruction.
@@ -167,6 +183,10 @@ void ChannelProxy::Context::Clear() {
 
 // Called on the IPC::Channel thread
 void ChannelProxy::Context::OnSendMessage(scoped_ptr<Message> message) {
+  // TODO(pkasting): Remove ScopedTracker below once crbug.com/477117 is fixed.
+  tracked_objects::ScopedTracker tracking_profile(
+      FROM_HERE_WITH_EXPLICIT_FUNCTION(
+          "477117 ChannelProxy::Context::OnSendMessage"));
   if (!channel_) {
     OnChannelClosed();
     return;
@@ -243,7 +263,7 @@ void ChannelProxy::Context::AddFilter(MessageFilter* filter) {
 
 // Called on the listener's thread
 void ChannelProxy::Context::OnDispatchMessage(const Message& message) {
-#ifdef IPC_MESSAGE_LOG_ENABLED
+#if defined(IPC_MESSAGE_LOG_ENABLED)
   Logging* logger = Logging::GetInstance();
   std::string name;
   logger->GetMessageText(message.type(), &name, &message, NULL);
@@ -302,6 +322,34 @@ void ChannelProxy::Context::OnDispatchBadMessage(const Message& message) {
     listener_->OnBadMessageReceived(message);
 }
 
+void ChannelProxy::Context::ClearChannel() {
+  base::AutoLock l(channel_lifetime_lock_);
+  channel_.reset();
+}
+
+void ChannelProxy::Context::SendFromThisThread(Message* message) {
+  base::AutoLock l(channel_lifetime_lock_);
+  if (!channel_)
+    return;
+  DCHECK(channel_->IsSendThreadSafe());
+  channel_->Send(message);
+}
+
+void ChannelProxy::Context::Send(Message* message) {
+  if (channel_send_thread_safe_) {
+    SendFromThisThread(message);
+    return;
+  }
+
+  ipc_task_runner()->PostTask(
+      FROM_HERE, base::Bind(&ChannelProxy::Context::OnSendMessage, this,
+                            base::Passed(scoped_ptr<Message>(message))));
+}
+
+bool ChannelProxy::Context::IsChannelSendThreadSafe() const {
+  return channel_send_thread_safe_;
+}
+
 //-----------------------------------------------------------------------------
 
 // static
@@ -309,20 +357,37 @@ scoped_ptr<ChannelProxy> ChannelProxy::Create(
     const IPC::ChannelHandle& channel_handle,
     Channel::Mode mode,
     Listener* listener,
-    base::SingleThreadTaskRunner* ipc_task_runner) {
+    const scoped_refptr<base::SingleThreadTaskRunner>& ipc_task_runner) {
   scoped_ptr<ChannelProxy> channel(new ChannelProxy(listener, ipc_task_runner));
   channel->Init(channel_handle, mode, true);
-  return channel.Pass();
+  return channel;
+}
+
+// static
+scoped_ptr<ChannelProxy> ChannelProxy::Create(
+    scoped_ptr<ChannelFactory> factory,
+    Listener* listener,
+    const scoped_refptr<base::SingleThreadTaskRunner>& ipc_task_runner) {
+  scoped_ptr<ChannelProxy> channel(new ChannelProxy(listener, ipc_task_runner));
+  channel->Init(std::move(factory), true);
+  return channel;
 }
 
 ChannelProxy::ChannelProxy(Context* context)
     : context_(context),
       did_init_(false) {
+#if defined(ENABLE_IPC_FUZZER)
+  outgoing_message_filter_ = NULL;
+#endif
 }
 
-ChannelProxy::ChannelProxy(Listener* listener,
-                           base::SingleThreadTaskRunner* ipc_task_runner)
+ChannelProxy::ChannelProxy(
+    Listener* listener,
+    const scoped_refptr<base::SingleThreadTaskRunner>& ipc_task_runner)
     : context_(new Context(listener, ipc_task_runner)), did_init_(false) {
+#if defined(ENABLE_IPC_FUZZER)
+  outgoing_message_filter_ = NULL;
+#endif
 }
 
 ChannelProxy::~ChannelProxy() {
@@ -334,8 +399,6 @@ ChannelProxy::~ChannelProxy() {
 void ChannelProxy::Init(const IPC::ChannelHandle& channel_handle,
                         Channel::Mode mode,
                         bool create_pipe_now) {
-  DCHECK(CalledOnValidThread());
-  DCHECK(!did_init_);
 #if defined(OS_POSIX)
   // When we are creating a server on POSIX, we need its file descriptor
   // to be created immediately so that it can be accessed and passed
@@ -345,17 +408,24 @@ void ChannelProxy::Init(const IPC::ChannelHandle& channel_handle,
     create_pipe_now = true;
   }
 #endif  // defined(OS_POSIX)
+  Init(ChannelFactory::Create(channel_handle, mode), create_pipe_now);
+}
+
+void ChannelProxy::Init(scoped_ptr<ChannelFactory> factory,
+                        bool create_pipe_now) {
+  DCHECK(CalledOnValidThread());
+  DCHECK(!did_init_);
 
   if (create_pipe_now) {
     // Create the channel immediately.  This effectively sets up the
     // low-level pipe so that the client can connect.  Without creating
     // the pipe immediately, it is possible for a listener to attempt
     // to connect and get an error since the pipe doesn't exist yet.
-    context_->CreateChannel(channel_handle, mode);
+    context_->CreateChannel(std::move(factory));
   } else {
     context_->ipc_task_runner()->PostTask(
         FROM_HERE, base::Bind(&Context::CreateChannel, context_.get(),
-                              channel_handle, mode));
+                              base::Passed(&factory)));
   }
 
   // complete initialization on the background thread
@@ -363,6 +433,7 @@ void ChannelProxy::Init(const IPC::ChannelHandle& channel_handle,
       FROM_HERE, base::Bind(&Context::OnChannelOpened, context_.get()));
 
   did_init_ = true;
+  OnChannelInit();
 }
 
 void ChannelProxy::Close() {
@@ -385,14 +456,19 @@ bool ChannelProxy::Send(Message* message) {
   // TODO(alexeypa): add DCHECK(CalledOnValidThread()) here. Currently there are
   // tests that call Send() from a wrong thread. See http://crbug.com/163523.
 
+#ifdef ENABLE_IPC_FUZZER
+  // In IPC fuzzing builds, it is possible to define a filter to apply to
+  // outgoing messages. It will either rewrite the message and return a new
+  // one, freeing the original, or return the message unchanged.
+  if (outgoing_message_filter())
+    message = outgoing_message_filter()->Rewrite(message);
+#endif
+
 #ifdef IPC_MESSAGE_LOG_ENABLED
   Logging::GetInstance()->OnSendMessage(message, context_->channel_id());
 #endif
 
-  context_->ipc_task_runner()->PostTask(
-      FROM_HERE,
-      base::Bind(&ChannelProxy::Context::OnSendMessage,
-                 context_, base::Passed(scoped_ptr<Message>(message))));
+  context_->Send(message);
   return true;
 }
 
@@ -416,7 +492,15 @@ void ChannelProxy::ClearIPCTaskRunner() {
   context()->ClearIPCTaskRunner();
 }
 
-#if defined(OS_POSIX) && !defined(OS_NACL)
+base::ProcessId ChannelProxy::GetPeerPID() const {
+  return context_->peer_pid_;
+}
+
+void ChannelProxy::OnSetAttachmentBrokerEndpoint() {
+  context()->set_attachment_broker_endpoint(is_attachment_broker_endpoint());
+}
+
+#if defined(OS_POSIX) && !defined(OS_NACL_SFI)
 // See the TODO regarding lazy initialization of the channel in
 // ChannelProxy::Init().
 int ChannelProxy::GetClientFileDescriptor() {
@@ -428,7 +512,7 @@ int ChannelProxy::GetClientFileDescriptor() {
   return channel->GetClientFileDescriptor();
 }
 
-int ChannelProxy::TakeClientFileDescriptor() {
+base::ScopedFD ChannelProxy::TakeClientFileDescriptor() {
   DCHECK(CalledOnValidThread());
 
   Channel* channel = context_.get()->channel_.get();
@@ -437,6 +521,9 @@ int ChannelProxy::TakeClientFileDescriptor() {
   return channel->TakeClientFileDescriptor();
 }
 #endif
+
+void ChannelProxy::OnChannelInit() {
+}
 
 //-----------------------------------------------------------------------------
 

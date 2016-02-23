@@ -5,12 +5,15 @@
 #ifndef IPC_IPC_SYNC_MESSAGE_H_
 #define IPC_IPC_SYNC_MESSAGE_H_
 
+#include <stdint.h>
 #if defined(OS_WIN)
 #include <windows.h>
 #endif
+
 #include <string>
-#include "base/basictypes.h"
+
 #include "base/memory/scoped_ptr.h"
+#include "build/build_config.h"
 #include "ipc/ipc_message.h"
 
 namespace base {
@@ -23,9 +26,11 @@ class MessageReplyDeserializer;
 
 class IPC_EXPORT SyncMessage : public Message {
  public:
-  SyncMessage(int32 routing_id, uint32 type, PriorityValue priority,
+  SyncMessage(int32_t routing_id,
+              uint32_t type,
+              PriorityValue priority,
               MessageReplyDeserializer* deserializer);
-  virtual ~SyncMessage();
+  ~SyncMessage() override;
 
   // Call this to get a deserializer for the output parameters.
   // Note that this can only be called once, and the caller is responsible
@@ -60,7 +65,7 @@ class IPC_EXPORT SyncMessage : public Message {
 
   // Given a reply message, returns an iterator to the beginning of the data
   // (i.e. skips over the synchronous specific data).
-  static PickleIterator GetDataIterator(const Message* msg);
+  static base::PickleIterator GetDataIterator(const Message* msg);
 
   // Given a synchronous message (or its reply), returns its id.
   static int GetMessageId(const Message& msg);
@@ -90,7 +95,7 @@ class IPC_EXPORT MessageReplyDeserializer {
   // Derived classes need to implement this, using the given iterator (which
   // is skipped past the header for synchronous messages).
   virtual bool SerializeOutputParameters(const Message& msg,
-                                         PickleIterator iter) = 0;
+                                         base::PickleIterator iter) = 0;
 };
 
 // When sending a synchronous message, this structure contains an object
